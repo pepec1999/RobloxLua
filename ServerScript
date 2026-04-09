@@ -1,0 +1,446 @@
+local DataStoreService = game:GetService("DataStoreService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local sharedFolder = ReplicatedStorage:WaitForChild("Shared")
+local InventoryRemotes = require(sharedFolder:WaitForChild("InventoryRemotes"))
+local ItemCatalog = require(sharedFolder:WaitForChild("ItemCatalog"))
+
+local INVENTORY_DATASTORE_NAME = "PlayerInventory_v1"
+local PICKUP_FOLDER_NAME = "PickupParts"
+local PICKUP_RESPAWN_DELAY_MIN = 5
+local PICKUP_RESPAWN_DELAY_MAX = 10
+local MAX_DRAG_DISTANCE = 25
+local RESPAWN_ATTRIBUTE_NAME = "RespawnsAfterPickup"
+
+local randomGenerator = Random.new()
+
+local inventoryStore = DataStoreService:GetDataStore(INVENTORY_DATASTORE_NAME)
+local inventories = {}
+local pickupTemplates = {}
+local pickupLocks = {}
+local registeredPrompts = {}
+
+local function deepCopyInventory(sourceInventory)
+	local copy = {
+		items = {},
+	}
+
+	if sourceInventory and sourceInventory.items then
+		for itemId, amount in pairs(sourceInventory.items) do
+			copy.items[itemId] = amount
+		end
+	end
+
+	return copy
+end
+
+local function getDefaultInventory()
+	return {
+		items = {},
+	}
+end
+
+local function getPlayerKey(player)
+	return string.format("player_%d", player.UserId)
+end
+
+local function ensureRemoteInstances()
+	local folder = ReplicatedStorage:FindFirstChild(InventoryRemotes.Names.Folder)
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = InventoryRemotes.Names.Folder
+		folder.Parent = ReplicatedStorage
+	end
+
+	local inventoryUpdated = folder:FindFirstChild(InventoryRemotes.Names.InventoryUpdated)
+	if not inventoryUpdated then
+		inventoryUpdated = Instance.new("RemoteEvent")
+		inventoryUpdated.Name = InventoryRemotes.Names.InventoryUpdated
+		inventoryUpdated.Parent = folder
+	end
+
+	local dropInventoryItem = folder:FindFirstChild(InventoryRemotes.Names.DropInventoryItem)
+	if not dropInventoryItem then
+		dropInventoryItem = Instance.new("RemoteEvent")
+		dropInventoryItem.Name = InventoryRemotes.Names.DropInventoryItem
+		dropInventoryItem.Parent = folder
+	end
+
+	local movePickup = folder:FindFirstChild(InventoryRemotes.Names.MovePickup)
+	if not movePickup then
+		movePickup = Instance.new("RemoteEvent")
+		movePickup.Name = InventoryRemotes.Names.MovePickup
+		movePickup.Parent = folder
+	end
+
+	local requestInventory = folder:FindFirstChild(InventoryRemotes.Names.RequestInventory)
+	if not requestInventory then
+		requestInventory = Instance.new("RemoteFunction")
+		requestInventory.Name = InventoryRemotes.Names.RequestInventory
+		requestInventory.Parent = folder
+	end
+
+	return inventoryUpdated, dropInventoryItem, movePickup, requestInventory
+end
+
+local inventoryUpdatedEvent, dropInventoryItemEvent, movePickupEvent, requestInventoryFunction = ensureRemoteInstances()
+
+local function getInventory(player)
+	local inventory = inventories[player]
+	if inventory then
+		return inventory
+	end
+
+	inventory = getDefaultInventory()
+	inventories[player] = inventory
+	return inventory
+end
+
+local function sendInventory(player)
+	inventoryUpdatedEvent:FireClient(player, deepCopyInventory(getInventory(player)))
+end
+
+local function saveInventory(player)
+	local inventory = inventories[player]
+	if not inventory or player.UserId <= 0 then
+		return
+	end
+
+	local success, errorMessage = pcall(function()
+		inventoryStore:SetAsync(getPlayerKey(player), inventory.items)
+	end)
+
+	if not success then
+		warn(string.format("Failed to save inventory for %s: %s", player.Name, errorMessage))
+	end
+end
+
+local function loadInventory(player)
+	local inventory = getDefaultInventory()
+
+	if player.UserId > 0 then
+		local success, data = pcall(function()
+			return inventoryStore:GetAsync(getPlayerKey(player))
+		end)
+
+		if success and type(data) == "table" then
+			for itemId, amount in pairs(data) do
+				if ItemCatalog[itemId] and type(amount) == "number" and amount > 0 then
+					inventory.items[itemId] = math.floor(amount)
+				end
+			end
+		elseif not success then
+			warn(string.format("Failed to load inventory for %s: %s", player.Name, data))
+		end
+	end
+
+	inventories[player] = inventory
+	return inventory
+end
+
+local function addItem(player, itemId, amount)
+	local itemDefinition = ItemCatalog[itemId]
+	if not itemDefinition then
+		return false
+	end
+
+	local inventory = getInventory(player)
+	local currentAmount = inventory.items[itemId] or 0
+	local nextAmount = math.clamp(currentAmount + amount, 0, itemDefinition.MaxStack)
+
+	if nextAmount == currentAmount then
+		return false
+	end
+
+	inventory.items[itemId] = nextAmount
+	sendInventory(player)
+	saveInventory(player)
+	return true
+end
+
+local function removeItem(player, itemId, amount)
+	local inventory = getInventory(player)
+	local currentAmount = inventory.items[itemId] or 0
+	if currentAmount < amount then
+		return false
+	end
+
+	local nextAmount = currentAmount - amount
+	if nextAmount > 0 then
+		inventory.items[itemId] = nextAmount
+	else
+		inventory.items[itemId] = nil
+	end
+
+	sendInventory(player)
+	saveInventory(player)
+	return true
+end
+
+requestInventoryFunction.OnServerInvoke = function(player)
+	return deepCopyInventory(getInventory(player))
+end
+
+local function getPickupContainer()
+	return Workspace:FindFirstChild(PICKUP_FOLDER_NAME)
+end
+
+local function cachePickupTemplate(itemId, pickupPart)
+	if not pickupTemplates[itemId] and pickupPart and pickupPart:IsA("BasePart") then
+		pickupTemplates[itemId] = pickupPart:Clone()
+	end
+end
+
+local function setPickupRespawnEnabled(pickupPart, shouldRespawn)
+	if pickupPart and pickupPart:IsA("BasePart") then
+		pickupPart:SetAttribute(RESPAWN_ATTRIBUTE_NAME, shouldRespawn)
+	end
+end
+
+local function shouldPickupRespawn(pickupPart)
+	return pickupPart and pickupPart:GetAttribute(RESPAWN_ATTRIBUTE_NAME) == true
+end
+
+local function setPromptsEnabled(instance, isEnabled)
+	if not instance then
+		return
+	end
+
+	for _, descendant in ipairs(instance:GetDescendants()) do
+		if descendant:IsA("ProximityPrompt") then
+			descendant.Enabled = isEnabled
+		end
+	end
+	if instance:IsA("ProximityPrompt") then
+		instance.Enabled = isEnabled
+	end
+end
+
+local function isPickupPart(instance)
+	local pickupContainer = getPickupContainer()
+	return pickupContainer ~= nil and instance:IsA("BasePart") and instance:IsDescendantOf(pickupContainer)
+end
+
+movePickupEvent.OnServerEvent:Connect(function(player, pickupPart, targetPosition)
+	if not player or not pickupPart or not targetPosition then
+		return
+	end
+
+	if typeof(targetPosition) ~= "Vector3" or not isPickupPart(pickupPart) then
+		return
+	end
+
+	if not pickupPart:IsDescendantOf(Workspace) then
+		return
+	end
+
+	local character = player.Character
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+	if not rootPart then
+		return
+	end
+
+	if (rootPart.Position - pickupPart.Position).Magnitude > MAX_DRAG_DISTANCE then
+		return
+	end
+
+	local targetCFrame = CFrame.fromMatrix(targetPosition, pickupPart.CFrame.XVector, pickupPart.CFrame.YVector, pickupPart.CFrame.ZVector)
+	pickupPart.CFrame = targetCFrame
+end)
+
+dropInventoryItemEvent.OnServerEvent:Connect(function(player, itemId, amountToDrop)
+	if type(itemId) ~= "string" or not ItemCatalog[itemId] then
+		return
+	end
+
+	if amountToDrop == nil then
+		amountToDrop = 1
+	end
+
+	if type(amountToDrop) ~= "number" then
+		return
+	end
+
+	amountToDrop = math.max(1, math.floor(amountToDrop))
+
+	local pickupTemplate = pickupTemplates[itemId]
+	local pickupContainer = getPickupContainer()
+	if not pickupTemplate or not pickupContainer then
+		return
+	end
+
+	local character = player.Character
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+	if not rootPart then
+		return
+	end
+
+	local inventory = getInventory(player)
+	local currentAmount = inventory.items[itemId] or 0
+	local safeAmountToDrop = math.min(amountToDrop, currentAmount)
+	if safeAmountToDrop <= 0 then
+		return
+	end
+
+	if not removeItem(player, itemId, safeAmountToDrop) then
+		return
+	end
+
+	for index = 1, safeAmountToDrop do
+		local droppedClone = pickupTemplate:Clone()
+		local forwardOffset = rootPart.CFrame.LookVector * (5 + index * 0.4)
+		local sideOffset = rootPart.CFrame.RightVector * randomGenerator:NextNumber(-2.5, 2.5)
+		local dropPosition = rootPart.Position + forwardOffset + sideOffset
+		local partHeight = droppedClone.Size.Y * 0.5
+		local targetPosition = Vector3.new(dropPosition.X, rootPart.Position.Y - 2 + partHeight, dropPosition.Z)
+		local targetCFrame = CFrame.fromMatrix(targetPosition, droppedClone.CFrame.XVector, droppedClone.CFrame.YVector, droppedClone.CFrame.ZVector)
+
+		setPickupRespawnEnabled(droppedClone, false)
+		droppedClone.CFrame = targetCFrame
+		droppedClone.Parent = pickupContainer
+	end
+end)
+
+local function resolveItemIdFromPrompt(prompt)
+	local parent = prompt.Parent
+	if not parent or not parent:IsA("BasePart") then
+		return nil
+	end
+
+	local attributeItemId = parent:GetAttribute("ItemId")
+	if type(attributeItemId) == "string" and ItemCatalog[attributeItemId] then
+		return attributeItemId
+	end
+
+	if ItemCatalog[parent.Name] then
+		return parent.Name
+	end
+
+	return nil
+end
+
+local function connectPrompt(prompt)
+	if registeredPrompts[prompt] then
+		return
+	end
+
+	registeredPrompts[prompt] = true
+
+	local initialItemId = resolveItemIdFromPrompt(prompt)
+	if initialItemId then
+		cachePickupTemplate(initialItemId, prompt.Parent)
+	end
+
+	prompt.Triggered:Connect(function(player)
+		if not player or not player:IsDescendantOf(Players) then
+			return
+		end
+
+		local pickupPart = prompt.Parent
+		if not prompt.Enabled or not pickupPart or not pickupPart:IsA("BasePart") then
+			return
+		end
+
+		if pickupLocks[pickupPart] then
+			return
+		end
+
+		pickupLocks[pickupPart] = true
+		prompt.Enabled = false
+
+		local itemId = resolveItemIdFromPrompt(prompt)
+		if not itemId then
+			pickupLocks[pickupPart] = nil
+			prompt.Enabled = true
+			warn("Pickup prompt missing valid ItemId attribute or supported part name")
+			return
+		end
+
+		local pickupParent = pickupPart.Parent
+		local originalCFrame = pickupPart.CFrame
+		local respawnClone = nil
+		local respawnCFrame = nil
+
+		if shouldPickupRespawn(pickupPart) then
+			respawnClone = pickupPart:Clone()
+			setPickupRespawnEnabled(respawnClone, true)
+			setPromptsEnabled(respawnClone, true)
+
+			local respawnOffset = Vector3.new(
+				randomGenerator:NextNumber(-10, 10),
+				0,
+				randomGenerator:NextNumber(-10, 10)
+			)
+			respawnCFrame = originalCFrame + respawnOffset
+		end
+
+		pickupPart.Parent = nil
+
+		if addItem(player, itemId, 1) then
+			pickupPart:Destroy()
+			pickupLocks[pickupPart] = nil
+
+			if respawnClone and respawnCFrame then
+				local respawnDelay = randomGenerator:NextNumber(PICKUP_RESPAWN_DELAY_MIN, PICKUP_RESPAWN_DELAY_MAX)
+				task.delay(respawnDelay, function()
+					if pickupParent and pickupParent.Parent then
+						respawnClone.CFrame = respawnCFrame
+						respawnClone.Parent = pickupParent
+					end
+				end)
+			end
+		else
+			pickupPart.CFrame = originalCFrame
+			pickupPart.Parent = pickupParent
+			prompt.Enabled = true
+			pickupLocks[pickupPart] = nil
+		end
+	end)
+end
+
+local function registerPickupContainer(pickupContainer)
+	for _, descendant in ipairs(pickupContainer:GetDescendants()) do
+		if descendant:IsA("ProximityPrompt") then
+			setPickupRespawnEnabled(descendant.Parent, true)
+			connectPrompt(descendant)
+		end
+	end
+
+	pickupContainer.DescendantAdded:Connect(function(descendant)
+		if descendant:IsA("ProximityPrompt") then
+			connectPrompt(descendant)
+		end
+	end)
+end
+
+Players.PlayerAdded:Connect(function(player)
+	loadInventory(player)
+	sendInventory(player)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	saveInventory(player)
+	inventories[player] = nil
+end)
+
+game:BindToClose(function()
+	for _, player in ipairs(Players:GetPlayers()) do
+		saveInventory(player)
+	end
+end)
+
+local pickupContainer = Workspace:FindFirstChild(PICKUP_FOLDER_NAME)
+if pickupContainer then
+	registerPickupContainer(pickupContainer)
+else
+	warn(string.format("Workspace.%s was not found. Add a folder for pickup parts in Studio.", PICKUP_FOLDER_NAME))
+	Workspace.ChildAdded:Connect(function(child)
+		if child.Name == PICKUP_FOLDER_NAME then
+			registerPickupContainer(child)
+		end
+	end)
+end
+
+print("Inventory server initialized")
