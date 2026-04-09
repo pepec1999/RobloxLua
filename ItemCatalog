@@ -1,0 +1,24 @@
+local ItemCatalog = {
+	Bat = {
+		DisplayName = "Bat",
+		MaxStack = 99,
+	},
+	Ball = {
+		DisplayName = "Ball",
+		MaxStack = 99,
+	},
+	Pipe = {
+		DisplayName = "Pipe",
+		MaxStack = 99,
+	},
+	IceCube = {
+		DisplayName = "Ice Cube",
+		MaxStack = 99,
+	},
+	Sword = {
+		DisplayName = "Sword",
+		MaxStack = 99,
+	},
+}
+
+return ItemCatalog
