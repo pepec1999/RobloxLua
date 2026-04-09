@@ -1,0 +1,39 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local REMOTES_FOLDER_NAME = "InventoryRemotes"
+local DROP_ITEM_EVENT_NAME = "DropInventoryItem"
+local INVENTORY_UPDATED_EVENT_NAME = "InventoryUpdated"
+local MOVE_PICKUP_EVENT_NAME = "MovePickup"
+local REQUEST_INVENTORY_FUNCTION_NAME = "RequestInventory"
+
+local InventoryRemotes = {
+	Names = {
+		Folder = REMOTES_FOLDER_NAME,
+		DropInventoryItem = DROP_ITEM_EVENT_NAME,
+		InventoryUpdated = INVENTORY_UPDATED_EVENT_NAME,
+		MovePickup = MOVE_PICKUP_EVENT_NAME,
+		RequestInventory = REQUEST_INVENTORY_FUNCTION_NAME,
+	},
+}
+
+function InventoryRemotes.getFolder()
+	return ReplicatedStorage:WaitForChild(REMOTES_FOLDER_NAME)
+end
+
+function InventoryRemotes.getInventoryUpdatedEvent()
+	return InventoryRemotes.getFolder():WaitForChild(INVENTORY_UPDATED_EVENT_NAME)
+end
+
+function InventoryRemotes.getDropInventoryItemEvent()
+	return InventoryRemotes.getFolder():WaitForChild(DROP_ITEM_EVENT_NAME)
+end
+
+function InventoryRemotes.getMovePickupEvent()
+	return InventoryRemotes.getFolder():WaitForChild(MOVE_PICKUP_EVENT_NAME)
+end
+
+function InventoryRemotes.getRequestInventoryFunction()
+	return InventoryRemotes.getFolder():WaitForChild(REQUEST_INVENTORY_FUNCTION_NAME)
+end
+
+return InventoryRemotes
