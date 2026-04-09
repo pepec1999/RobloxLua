@@ -1,0 +1,591 @@
+local Players = game:GetService("Players")
+local GuiService = game:GetService("GuiService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local StarterGui = game:GetService("StarterGui")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local mouse = player:GetMouse()
+local playerGui = player:WaitForChild("PlayerGui")
+local sharedFolder = ReplicatedStorage:WaitForChild("Shared")
+
+local InventoryRemotes = require(sharedFolder:WaitForChild("InventoryRemotes"))
+local ItemCatalog = require(sharedFolder:WaitForChild("ItemCatalog"))
+
+local function disableBackpack()
+	pcall(function()
+		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
+	end)
+end
+
+local function findInventoryGui()
+	for _, gui in ipairs(playerGui:GetChildren()) do
+		if gui:IsA("ScreenGui") and gui:FindFirstChild("InvFrame") and gui:FindFirstChild("InvButton") then
+			return gui
+		end
+	end
+
+	while true do
+		local child = playerGui.ChildAdded:Wait()
+		if child:IsA("ScreenGui") and child:FindFirstChild("InvFrame") and child:FindFirstChild("InvButton") then
+			return child
+		end
+	end
+end
+
+local inventoryGui = findInventoryGui()
+local invFrame = inventoryGui:WaitForChild("InvFrame")
+local invButton = inventoryGui:WaitForChild("InvButton")
+local gridLayout = invFrame:FindFirstChildWhichIsA("UIGridLayout")
+
+local function ensureDropLabel()
+	local dropLabel = inventoryGui:FindFirstChild("DropLabel")
+	if dropLabel and dropLabel:IsA("TextLabel") then
+		return dropLabel
+	end
+
+	dropLabel = Instance.new("TextLabel")
+	dropLabel.Name = "DropLabel"
+	dropLabel.AnchorPoint = Vector2.new(0.5, 1)
+	dropLabel.Position = UDim2.new(0.5, 0, 1, -24)
+	dropLabel.Size = UDim2.new(0, 180, 0, 48)
+	dropLabel.BackgroundColor3 = Color3.fromRGB(195, 68, 68)
+	dropLabel.BackgroundTransparency = 0.1
+	dropLabel.BorderSizePixel = 0
+	dropLabel.Text = "Drop Here"
+	dropLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	dropLabel.TextScaled = true
+	dropLabel.Visible = false
+	dropLabel.Parent = inventoryGui
+
+	return dropLabel
+end
+
+local dropLabel = ensureDropLabel()
+
+local inventoryUpdatedEvent = InventoryRemotes.getInventoryUpdatedEvent()
+local dropInventoryItemEvent = InventoryRemotes.getDropInventoryItemEvent()
+local movePickupEvent = InventoryRemotes.getMovePickupEvent()
+local requestInventoryFunction = InventoryRemotes.getRequestInventoryFunction()
+
+local slotFrames = {}
+local previewTemplates = {}
+local dragState = nil
+local nextLayoutOrder = 1
+local worldDragState = nil
+local lastWorldDragSend = 0
+local PREVIEW_ROTATION_SPEED = math.rad(45)
+
+local function bringSlotTextToFront(slot)
+	slot.frame.ZIndex = 3
+	slot.viewport.ZIndex = 3
+	slot.itemText.ZIndex = 4
+	slot.numbText.ZIndex = 4
+end
+
+local function restoreSlotZIndex(slot)
+	slot.frame.ZIndex = 1
+	slot.viewport.ZIndex = 1
+	slot.itemText.ZIndex = 2
+	slot.numbText.ZIndex = 2
+end
+
+local function pointInsideFrame(frame, point)
+	local position = frame.AbsolutePosition
+	local size = frame.AbsoluteSize
+	return point.X >= position.X
+		and point.X <= position.X + size.X
+		and point.Y >= position.Y
+		and point.Y <= position.Y + size.Y
+end
+
+local function findDropTarget(draggedItemId, point)
+	for itemId, slot in pairs(slotFrames) do
+		if itemId ~= draggedItemId and slot.frame.Visible and pointInsideFrame(slot.frame, point) then
+			return slot
+		end
+	end
+
+	return nil
+end
+
+local function getInputPosition2D(input)
+	return Vector2.new(input.Position.X, input.Position.Y)
+end
+
+local function getPointerPosition(input)
+	if input and input.UserInputType == Enum.UserInputType.Touch then
+		return getInputPosition2D(input)
+	end
+
+	local guiInset = GuiService:GetGuiInset()
+	local mousePosition = UserInputService:GetMouseLocation()
+	return mousePosition - guiInset
+end
+
+local function beginDrag(slot, input)
+	if dragState or not invFrame.Visible then
+		return
+	end
+
+	local inputPosition = getPointerPosition(input)
+	local startPosition = slot.frame.AbsolutePosition
+	local startSize = slot.frame.AbsoluteSize
+
+	dragState = {
+		slot = slot,
+		dragInputType = input.UserInputType,
+		startParent = slot.frame.Parent,
+		startLayoutOrder = slot.frame.LayoutOrder,
+		startPosition = startPosition,
+		startSize = startSize,
+		dragOffset = inputPosition - slot.frame.AbsolutePosition,
+	}
+
+	bringSlotTextToFront(slot)
+	slot.frame.Parent = inventoryGui
+	slot.frame.Position = UDim2.fromOffset(startPosition.X, startPosition.Y)
+	slot.frame.Size = UDim2.fromOffset(startSize.X, startSize.Y)
+	if gridLayout then
+		slot.frame.LayoutOrder = dragState.startLayoutOrder
+	end
+	if slot.viewport then
+		slot.viewport.Active = false
+	end
+end
+
+local function updateDrag(input)
+	if not dragState then
+		return
+	end
+
+	local newPosition = getPointerPosition(input) - dragState.dragOffset
+	dragState.slot.frame.Position = UDim2.fromOffset(newPosition.X, newPosition.Y)
+end
+
+local function endDrag()
+	if not dragState then
+		return
+	end
+
+	local slot = dragState.slot
+	local dropPoint = getPointerPosition()
+	local dropTarget = nil
+	local shouldDropItem = dropLabel.Visible and pointInsideFrame(dropLabel, dropPoint)
+	if not shouldDropItem then
+		dropTarget = findDropTarget(slot.itemId, dropPoint)
+	end
+
+	if shouldDropItem then
+		dropInventoryItemEvent:FireServer(slot.itemId)
+	elseif dropTarget then
+		local targetOrder = dropTarget.frame.LayoutOrder
+		dropTarget.frame.LayoutOrder = dragState.startLayoutOrder
+		slot.frame.LayoutOrder = targetOrder
+	end
+
+	slot.frame.Parent = dragState.startParent
+	if gridLayout then
+		slot.frame.Size = gridLayout.CellSize
+	else
+		slot.frame.Size = UDim2.new(0, slot.frame.AbsoluteSize.X, 0, slot.frame.AbsoluteSize.Y)
+	end
+	slot.frame.Position = UDim2.new()
+	if slot.viewport then
+		slot.viewport.Active = true
+	end
+	restoreSlotZIndex(slot)
+	dragState = nil
+end
+
+local function getPickupContainer()
+	return Workspace:FindFirstChild("PickupParts")
+end
+
+local function getPickupPartFromInstance(instance)
+	local pickupContainer = getPickupContainer()
+	if not pickupContainer then
+		return nil
+	end
+
+	local current = instance
+	while current and current ~= pickupContainer do
+		if current:IsA("BasePart") and current.Parent == pickupContainer then
+			return current
+		end
+		current = current.Parent
+	end
+
+	return nil
+end
+
+local function getPointerRay(input)
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+
+	local pointerPosition = getPointerPosition(input)
+	return camera:ViewportPointToRay(pointerPosition.X, pointerPosition.Y)
+end
+
+local function getRayPlaneIntersection(ray, planeY)
+	if not ray or math.abs(ray.Direction.Y) < 0.001 then
+		return nil
+	end
+
+	local distance = (planeY - ray.Origin.Y) / ray.Direction.Y
+	if distance <= 0 then
+		return nil
+	end
+
+	return ray.Origin + ray.Direction * distance
+end
+
+local function updateWorldPartPosition(input)
+	if not worldDragState then
+		return
+	end
+
+	local intersection = getRayPlaneIntersection(getPointerRay(input), worldDragState.planeY)
+	if not intersection then
+		return
+	end
+
+	local targetPosition = Vector3.new(
+		intersection.X - worldDragState.dragOffset.X,
+		worldDragState.planeY,
+		intersection.Z - worldDragState.dragOffset.Z
+	)
+
+	local part = worldDragState.part
+	part.CFrame = CFrame.fromMatrix(targetPosition, part.CFrame.XVector, part.CFrame.YVector, part.CFrame.ZVector)
+
+	local now = os.clock()
+	if now - lastWorldDragSend >= 0.05 then
+		lastWorldDragSend = now
+		movePickupEvent:FireServer(part, targetPosition)
+	end
+	worldDragState.lastTargetPosition = targetPosition
+end
+
+local function beginWorldDrag(input)
+	if dragState or worldDragState or invFrame.Visible then
+		return
+	end
+
+	local target = getPickupPartFromInstance(mouse.Target)
+	if not target then
+		return
+	end
+
+	local hitPosition = mouse.Hit.Position
+	worldDragState = {
+		part = target,
+		dragInputType = input.UserInputType,
+		planeY = target.Position.Y,
+		dragOffset = Vector3.new(hitPosition.X - target.Position.X, 0, hitPosition.Z - target.Position.Z),
+		lastTargetPosition = target.Position,
+	}
+
+	lastWorldDragSend = 0
+	updateWorldPartPosition(input)
+end
+
+local function endWorldDrag()
+	if not worldDragState then
+		return
+	end
+
+	if worldDragState.lastTargetPosition then
+		movePickupEvent:FireServer(worldDragState.part, worldDragState.lastTargetPosition)
+	end
+
+	worldDragState = nil
+end
+
+local function getItemIdFromInstance(instance)
+	local attributeItemId = instance:GetAttribute("ItemId")
+	if type(attributeItemId) == "string" and ItemCatalog[attributeItemId] then
+		return attributeItemId
+	end
+
+	if ItemCatalog[instance.Name] then
+		return instance.Name
+	end
+
+	return nil
+end
+
+local function findPreviewTemplate(itemId)
+	if previewTemplates[itemId] then
+		return previewTemplates[itemId]:Clone()
+	end
+
+	local pickupContainer = getPickupContainer()
+	if not pickupContainer then
+		return nil
+	end
+
+	for _, descendant in ipairs(pickupContainer:GetDescendants()) do
+		if descendant:IsA("Model") or descendant:IsA("BasePart") then
+			if getItemIdFromInstance(descendant) == itemId then
+				previewTemplates[itemId] = descendant:Clone()
+				return previewTemplates[itemId]:Clone()
+			end
+		end
+	end
+
+	return nil
+end
+
+local function ensureViewportFrame(frame)
+	local viewport = frame:FindFirstChild("ItemViewport")
+	if not viewport then
+		viewport = Instance.new("ViewportFrame")
+		viewport.Name = "ItemViewport"
+		viewport.BackgroundTransparency = 1
+		viewport.BorderSizePixel = 0
+		viewport.Position = UDim2.new(0, 4, 0, 4)
+		viewport.Size = UDim2.new(1, -8, 1, -30)
+		viewport.Parent = frame
+	end
+
+	local worldModel = viewport:FindFirstChild("PreviewWorld")
+	if not worldModel then
+		worldModel = Instance.new("WorldModel")
+		worldModel.Name = "PreviewWorld"
+		worldModel.Parent = viewport
+	end
+
+	local camera = viewport.CurrentCamera
+	if not camera then
+		camera = Instance.new("Camera")
+		camera.Name = "PreviewCamera"
+		camera.Parent = viewport
+		viewport.CurrentCamera = camera
+	end
+
+	return viewport, worldModel, camera
+end
+
+local function preparePreviewInstance(instance)
+	for _, descendant in ipairs(instance:GetDescendants()) do
+		if descendant:IsA("Script") or descendant:IsA("LocalScript") or descendant:IsA("ModuleScript") or descendant:IsA("ProximityPrompt") then
+			descendant:Destroy()
+		elseif descendant:IsA("BasePart") then
+			descendant.Anchored = true
+			descendant.CanCollide = false
+			descendant.CanQuery = false
+			descendant.CanTouch = false
+			if descendant:IsA("MeshPart") then
+				descendant.MaterialVariant = ""
+			end
+		end
+	end
+
+	if instance:IsA("BasePart") then
+		instance.Anchored = true
+		instance.CanCollide = false
+		instance.CanQuery = false
+		instance.CanTouch = false
+	end
+end
+
+local function setPreviewModelPose(instance)
+	local previewRotation = CFrame.Angles(math.rad(-15), math.rad(35), 0)
+	if instance:IsA("Model") then
+		instance:PivotTo(previewRotation)
+	else
+		instance.CFrame = previewRotation
+	end
+end
+
+local function getPreviewBounds(instance)
+	if instance:IsA("Model") then
+		return instance:GetBoundingBox()
+	end
+
+	return instance.CFrame, instance.Size
+end
+
+local function renderViewportPreview(itemId, slot)
+	local previewTemplate = findPreviewTemplate(itemId)
+	if not previewTemplate then
+		return
+	end
+
+	for _, child in ipairs(slot.worldModel:GetChildren()) do
+		child:Destroy()
+	end
+
+	preparePreviewInstance(previewTemplate)
+	previewTemplate.Parent = slot.worldModel
+	setPreviewModelPose(previewTemplate)
+	slot.previewInstance = previewTemplate
+	slot.previewAngle = 0
+
+	local _, size = getPreviewBounds(previewTemplate)
+	local maxSize = math.max(size.X, size.Y, size.Z)
+	local distance = math.max(4, maxSize * 2.2)
+	local focus = Vector3.new(0, 0, 0)
+
+	slot.camera.FieldOfView = 55
+	slot.camera.CFrame = CFrame.new(Vector3.new(0, maxSize * 0.35, distance), focus)
+end
+
+local function registerSlotFrame(frame)
+	if not frame:IsA("Frame") or not frame.Name:match("Frame$") then
+		return
+	end
+
+	local itemId = frame.Name:gsub("Frame$", "")
+	if not ItemCatalog[itemId] then
+		return
+	end
+
+	local numbText = frame:FindFirstChild("NumbText")
+	local itemText = frame:FindFirstChild("ItemText")
+	if not numbText or not itemText then
+		warn(string.format("Inventory slot %s is missing NumbText or ItemText", frame.Name))
+		return
+	end
+
+	local viewport, worldModel, camera = ensureViewportFrame(frame)
+
+	slotFrames[itemId] = {
+		itemId = itemId,
+		amount = 0,
+		frame = frame,
+		numbText = numbText,
+		itemText = itemText,
+		previewAngle = 0,
+		previewInstance = nil,
+		viewport = viewport,
+		worldModel = worldModel,
+		camera = camera,
+	}
+
+	frame.Active = true
+	if frame.LayoutOrder == 0 then
+		frame.LayoutOrder = nextLayoutOrder
+	end
+	nextLayoutOrder = math.max(nextLayoutOrder, frame.LayoutOrder + 1)
+	restoreSlotZIndex(slotFrames[itemId])
+
+	frame.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			beginDrag(slotFrames[itemId], input)
+		elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+			local slot = slotFrames[itemId]
+			if slot.amount > 0 then
+				dropInventoryItemEvent:FireServer(itemId, slot.amount)
+			end
+		end
+	end)
+
+	renderViewportPreview(itemId, slotFrames[itemId])
+end
+
+for _, child in ipairs(invFrame:GetChildren()) do
+	registerSlotFrame(child)
+end
+
+invFrame.ChildAdded:Connect(registerSlotFrame)
+
+local function renderInventory(inventory)
+	for itemId, slot in pairs(slotFrames) do
+		local amount = 0
+		if inventory and inventory.items and type(inventory.items[itemId]) == "number" then
+			amount = inventory.items[itemId]
+		end
+
+		slot.amount = amount
+		slot.itemText.Text = ItemCatalog[itemId].DisplayName
+		slot.numbText.Text = string.format("x%d", amount)
+		slot.frame.Visible = amount > 0
+		if amount > 0 and #slot.worldModel:GetChildren() == 0 then
+			renderViewportPreview(itemId, slot)
+		end
+	end
+end
+
+disableBackpack()
+invFrame.Visible = false
+
+for itemId, slot in pairs(slotFrames) do
+	slot.frame.Visible = false
+	slot.itemText.Text = ItemCatalog[itemId].DisplayName
+	slot.numbText.Text = "x0"
+end
+
+invButton.Activated:Connect(function()
+	invFrame.Visible = not invFrame.Visible
+	dropLabel.Visible = invFrame.Visible
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+	if gameProcessedEvent then
+		return
+	end
+
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		beginWorldDrag(input)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+		updateDrag(input)
+		updateWorldPartPosition(input)
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if not dragState then
+		if worldDragState and input.UserInputType == worldDragState.dragInputType then
+			endWorldDrag()
+		end
+		return
+	end
+
+	if input.UserInputType == dragState.dragInputType then
+		endDrag()
+	end
+
+	if worldDragState and input.UserInputType == worldDragState.dragInputType then
+		endWorldDrag()
+	end
+end)
+
+RunService.RenderStepped:Connect(function(deltaTime)
+	for _, slot in pairs(slotFrames) do
+		if slot.frame.Visible and slot.previewInstance then
+			slot.previewAngle = slot.previewAngle + PREVIEW_ROTATION_SPEED * deltaTime
+			local rotation = CFrame.Angles(math.rad(-15), math.rad(35) + slot.previewAngle, 0)
+			if slot.previewInstance:IsA("Model") then
+				slot.previewInstance:PivotTo(rotation)
+			else
+				slot.previewInstance.CFrame = rotation
+			end
+		end
+	end
+end)
+
+inventoryUpdatedEvent.OnClientEvent:Connect(function(inventory)
+	renderInventory(inventory)
+end)
+
+local success, inventory = pcall(function()
+	return requestInventoryFunction:InvokeServer()
+end)
+
+if success then
+	renderInventory(inventory)
+else
+	warn("Failed to request starting inventory from server")
+end
+
+print("Inventory client initialized")
